@@ -155,7 +155,7 @@ Ctrl-World is developed from the opensourced video foundation model [Stable-Vide
 If you find our work helpful, please leave us a star and cite our paper. Thank you!
 ```
 @article{guo2025ctrl,
-  title={Ctrl-World: A Controllable Generative World Model for Robot Manipulation},
+  title={Ctrl-world: A controllable generative world model for robot manipulation},
   author={Guo, Yanjiang and Shi, Lucy Xiaoyang and Chen, Jianyu and Finn, Chelsea},
   journal={arXiv preprint arXiv:2510.10125},
   year={2025}
