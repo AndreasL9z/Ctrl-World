@@ -83,30 +83,30 @@ if __name__ == "__main__":
         print(f'{data_root} {len(samples)} samples')
         samples_all.extend(samples)
         
-        # calculate the 1% and 99% of the action and state
+        # calculate the 1% and 99% of the state (for normalization during training)
         print("########################### state ###########################")
-        # print(np.array(samples_all[0]['actions']).shape)
-        # print(np.array(samples_all[0]['states']).shape)
-        # # state_all = [samples['states'] for samples in samples_all]
-        # state_all = []
-        # for samples in samples_all:
-        #     state = np.array(samples['states']).squeeze(0)
-        #     state_all.append(state)
+        if data_type == 'train' and len(samples_all) > 0:
+            state_all = []
+            for sample in samples_all:
+                state = np.array(sample['states']).squeeze(0)
+                state_all.append(state)
 
-        # state_all = np.array(state_all)
-        # print(state_all.shape)
-        # state_all = state_all.reshape(-1, state_all.shape[-1])
-        # # caculate the 1% and 99% of the action and state
-        # state_01 = np.percentile(state_all, 1, axis=0)
-        # state_99 = np.percentile(state_all, 99, axis=0)
-        # print('state_01:', state_01)
-        # print('state_99:', state_99)
-        # stat = {
-        #     'state_01': state_01.tolist(),
-        #     'state_99': state_99.tolist(),
-        # }
-        # with open(f'dataset_meta_info{dataset_name}/stat.json', 'w') as f:
-        #     json.dump(stat, f)
+            state_all = np.array(state_all)
+            print(f'state_all shape: {state_all.shape}')
+            state_all = state_all.reshape(-1, state_all.shape[-1])
+            # calculate the 1% and 99% percentile for normalization
+            state_01 = np.percentile(state_all, 1, axis=0)
+            state_99 = np.percentile(state_all, 99, axis=0)
+            print('state_01:', state_01)
+            print('state_99:', state_99)
+            stat = {
+                'state_01': state_01.tolist(),
+                'state_99': state_99.tolist(),
+            }
+            os.makedirs(f'dataset_meta_info/{dataset_name}', exist_ok=True)
+            with open(f'dataset_meta_info/{dataset_name}/stat.json', 'w') as f:
+                json.dump(stat, f)
+            print(f'✅ stat.json saved to dataset_meta_info/{dataset_name}/stat.json')
 
         
         # dataset meta info

@@ -10,7 +10,7 @@ class wm_args:
     # model paths
     svd_model_path = "/cephfs/shared/llm/stable-video-diffusion-img2vid"
     clip_model_path = "/cephfs/shared/llm/clip-vit-base-patch32"
-    ckpt_path = '/cephfs/cjyyj/code/video_evaluation/output2/exp33_210_s11/checkpoint-10000.pt'
+    ckpt_path = None
     pi_ckpt = '/cephfs/shared/llm/openpi/openpi-assets-preview/checkpoints/pi05_droid'
 
     # dataset parameters
@@ -23,7 +23,7 @@ class wm_args:
     prob=[1.0]
     annotation_name='annotation' #'annotation_all_skip1'
     num_workers=4
-    down_sample=3 # downsample 15hz to 5hz
+    down_sample=1 # DROID: downsample 15hz to 5hz (state/video ratio). LIBERO with frame_skip=4 should use down_sample=1
     skip_step = 1
     
 
@@ -39,12 +39,12 @@ class wm_args:
     learning_rate= 1e-5 # 5e-6
     gradient_accumulation_steps = 1
     mixed_precision = 'fp16'
-    train_batch_size = 4
+    train_batch_size = 2
     shuffle = True
-    num_train_epochs = 100
-    max_train_steps = 500000
-    checkpointing_steps = 20000
-    validation_steps = 2500
+    num_train_epochs = 10
+    max_train_steps = 10000
+    checkpointing_steps = 2000
+    validation_steps = 250
     max_grad_norm = 1.0
     # for val
     video_num= 10
@@ -105,6 +105,14 @@ class wm_args:
             self.start_idx = [8, 14, 8] * len(self.val_id)
             self.instruction = [""] * len(self.val_id)
             self.task_name = "Rollouts_replay"
+
+        elif self.task_type == "replay_libero":
+            self.val_dataset_dir = "dataset_example/libero"
+            self.val_id = ["99", "199", "299"]
+            self.start_idx = [0] * len(self.val_id)
+            self.instruction = [""] * len(self.val_id)
+            self.task_name = "Rollouts_replay_libero"
+            self.data_stat_path = "dataset_meta_info/libero/stat.json"
 
         elif self.task_type == "keyboard":
             self.val_dataset_dir = "dataset_example/droid_subset"
@@ -167,6 +175,19 @@ class wm_args:
             self.val_id = ['0012','0013']
             self.start_idx = [5] * len(self.val_id)
             self.instruction = ["stack the blue block on the red block"] * len(self.val_id)
+
+        elif self.task_type == "interact_libero":
+            self.interact_num = 15
+            self.val_dataset_dir = "dataset_example/libero"
+            self.val_id = ["99", "199", "299"]
+            self.start_idx = [0] * len(self.val_id)
+            self.instruction = [
+                "put the yellow and white mug in the microwave and close it",
+                "put both the alphabet soup and the tomato sauce in the basket",
+                "pick up the book and place it in the back compartment of the caddy",
+            ]
+            self.task_name = "Rollouts_interact_libero"
+            self.data_stat_path = "dataset_meta_info/libero/stat.json"
         
         else:
             raise ValueError(f"Unknown task type: {self.task_type}")

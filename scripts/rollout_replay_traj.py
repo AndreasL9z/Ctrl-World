@@ -104,7 +104,11 @@ class agent():
         instruction = anno['texts'][0]
         car_action = np.array(anno['states'])
         car_action = car_action[frames_ids]
-        joint_pos = np.array(anno['joints'])
+        if 'joints' in anno:
+            joint_pos = np.array(anno['joints'])
+        else:
+            # LIBERO format has no 'joints' field, states itself is joint angles + gripper
+            joint_pos = np.array(anno['states'])
         joint_pos = joint_pos[frames_ids]
 
         # get videos
@@ -229,6 +233,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_meta_info_path', type=str, default=None)
     parser.add_argument('--dataset_names', type=str, default=None)
     parser.add_argument('--task_type', type=str, default='replay')
+    parser.add_argument('--action_dim', type=int, default=None, help='Action dimension (7 or 8)')
     args_new = parser.parse_args()
 
     args = wm_args(task_type=args_new.task_type)
@@ -267,8 +272,8 @@ if __name__ == "__main__":
         assert first_latent.shape == (1, 4, 72, 40), f"Expected first_latent shape (1, 4, 72, 40), got {first_latent.shape}"
         for i in range(Agent.args.num_history*4):
             his_cond.append(first_latent)  # (1, 4, 72, 40)
-            his_joint.append(joint_pos_gt[0:1])  # (1, 7)
-            his_eef.append(eef_gt[0:1])  # (1, 7)
+            his_joint.append(joint_pos_gt[0:1])
+            his_eef.append(eef_gt[0:1])
 
         # interact loop
         for i in range(interact_num):
@@ -284,33 +289,33 @@ if __name__ == "__main__":
                 video_first = [v[0] for v in video_dict]
             else:
                 video_first = [v[-1] for v in video_dict_pred]
-            assert joint_first.shape == (8,), f"Expected joint_first shape (8,), got {joint_first.shape}"
-            assert state_first.shape == (7,), f"Expected state_first shape (7,), got {state_first.shape}"
+            assert joint_first.shape[-1] == joint_pos_gt.shape[-1], f"Expected joint_first dim {joint_pos_gt.shape[-1]}, got {joint_first.shape}"
+            assert state_first.shape[-1] == eef_gt.shape[-1], f"Expected state_first dim {eef_gt.shape[-1]}, got {state_first.shape}"
             
             # forward policy
             print("################ policy forward ####################")
             # in the trajectory replay model, we use action recorded in trajetcory
-            cartesian_pose = eef_gt[start_id:end_id]  # (pred_step, 7)
-            print("cartesian space action", cartesian_pose[0]) # output xyz and gripper for debug
-            print("cartesian space action", cartesian_pose[-1]) # output xyz and gripper for debug
+            cartesian_pose = eef_gt[start_id:end_id]  # (pred_step, action_dim)
+            print("action", cartesian_pose[0]) # output action for debug
+            print("action", cartesian_pose[-1]) # output action for debug
             
             print("################ world model forward ################")
             print(f'traj_id:{val_id_i}, interact step: {i}/{interact_num}')
             # retrive history cond and action cond
             history_idx = [0,0,-8,-6,-4,-2]
-            his_pose = np.concatenate([his_eef[idx] for idx in history_idx], axis=0)  # (4, 7)
+            his_pose = np.concatenate([his_eef[idx] for idx in history_idx], axis=0)  # (6, action_dim)
             action_cond = np.concatenate([his_pose, cartesian_pose], axis=0)
             his_cond_input = torch.cat([his_cond[idx] for idx in history_idx], dim=0).unsqueeze(0)
             current_latent = his_cond[-1]  # (1, 4, 72, 40)
             assert current_latent.shape == (1, 4, 72, 40), f"Expected current_latent shape (1, 4, 72, 40), got {current_latent.shape}"
-            assert action_cond.shape == (int(num_history+num_frames), 7), f"Expected action_cond shape ({int(num_history+num_frames)}, 7), got {action_cond.shape}"
+            assert action_cond.shape == (int(num_history+num_frames), args.action_dim), f"Expected action_cond shape ({int(num_history+num_frames)}, {args.action_dim}), got {action_cond.shape}"
             assert his_cond_input.shape == (1, int(num_history), 4, 72, 40), f"Expected his_cond_input shape (1, {int(num_history)}, 72, 40), got {his_cond_input.shape}"
             # forward world model
             videos_cat, true_videos, video_dict_pred, predicted_latents = Agent.forward_wm(action_cond, video_latent_true, current_latent, his_cond=his_cond_input,text=text_i if Agent.args.text_cond else None)
 
             print("################ record information ################")
             # push current step to history buffer
-            his_eef.append(cartesian_pose[pred_step-1:pred_step]) #(1,7)
+            his_eef.append(cartesian_pose[pred_step-1:pred_step])
             his_cond.append(torch.cat([v[pred_step-1] for v in predicted_latents], dim=1).unsqueeze(0))  # (1, 4, 72, 40)
             if i == interact_num - 1:
                 video_to_save.append(videos_cat)  # save all frames for the last interaction step

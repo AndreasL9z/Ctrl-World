@@ -27,7 +27,7 @@ import math
 
 def main(args):
     logger = get_logger(__name__, log_level="INFO")
-    swanlab.sync_wandb()
+    # swanlab.sync_wandb()  # 禁用 swanlab，只使用 wandb
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -251,6 +251,8 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_meta_info_path', type=str, default=None)
     # dataset_names
     parser.add_argument('--dataset_names', type=str, default=None)
+    parser.add_argument('--action_dim', type=int, default=None)
+    parser.add_argument('--down_sample', type=int, default=None)
     args_new = parser.parse_args()
     args = wm_args()
 
@@ -261,6 +263,9 @@ if __name__ == "__main__":
         return args
     
     args = merge_args(args, args_new)
+
+    # keep dataset_cfgs in sync with dataset_names
+    args.dataset_cfgs = args.dataset_names
 
     main(args)
 
