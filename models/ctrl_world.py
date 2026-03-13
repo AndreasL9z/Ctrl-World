@@ -312,12 +312,16 @@ class CrtlWorld(nn.Module):
         loss_flow_raw = torch.tensor(0.0, device=device, dtype=torch.float32)
         if 'flow' in batch and flow_lambda > 0:
             flow_data = batch['flow'].to(device=device, dtype=predict_x0.dtype)  # (B, T_pairs, 2, 72, 40)
-            future_preds = predict_x0[:, num_history:]   # (B, num_frames, 4, 72, 40)
+            future_preds = predict_x0[:, num_history:]   # (B, num_frames, 4, 72, 40)  predicted
+            future_gt    = latents[:, num_history:].to(dtype=predict_x0.dtype)  # (B, num_frames, 4, 72, 40)  GT
             n_pairs = future_preds.shape[1] - 1
             if n_pairs > 0:
                 warp_loss = 0.0
                 for t in range(n_pairs):
-                    warped = warp_per_camera(future_preds[:, t], flow_data[:, t])
+                    # Warp GT frame t with GT flow → should match predicted frame t+1
+                    # Anchor is GT (stable), target is prediction: directly penalizes
+                    # "is the model's prediction in the right place after real motion"
+                    warped = warp_per_camera(future_gt[:, t], flow_data[:, t])
                     warp_loss += ((warped - future_preds[:, t + 1]) ** 2).mean()
                 loss_flow_raw = (warp_loss / n_pairs).detach().float()
                 loss += flow_lambda * (warp_loss / n_pairs)

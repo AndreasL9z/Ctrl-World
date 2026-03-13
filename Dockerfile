@@ -3,7 +3,7 @@
 # Base: CUDA 12.6.3 + cuDNN (devel) + Ubuntu 22.04
 # Python 3.11, PyTorch 2.7.1 (via conda, matches local env)
 # ============================================================
-FROM --platform=linux/amd64 nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -31,10 +31,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Miniconda
-RUN curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh && \
-    bash /tmp/miniconda.sh -b -p /opt/conda && \
-    rm /tmp/miniconda.sh && \
+# Install Miniforge (replaces Miniconda, no Anaconda TOS issues, uses conda-forge)
+RUN curl -fsSL https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -o /tmp/miniforge.sh && \
+    bash /tmp/miniforge.sh -b -p /opt/conda && \
+    rm /tmp/miniforge.sh && \
     conda clean -afy
 
 # Create conda environment with Python 3.11
