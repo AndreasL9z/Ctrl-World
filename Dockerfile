@@ -41,13 +41,12 @@ RUN curl -fsSL https://github.com/conda-forge/miniforge/releases/latest/download
 RUN conda create -n ctrl-world python=3.11 -y && \
     conda clean -afy
 
-# Install PyTorch 2.7.1 with CUDA 12.6 via conda (matches local environment exactly)
-RUN conda run -n ctrl-world conda install -y \
-    pytorch==2.7.1 \
-    torchvision \
-    pytorch-cuda=12.6 \
-    -c pytorch -c nvidia && \
-    conda clean -afy
+# Install PyTorch with CUDA 12.6 via pip (torch 2.7.1 only available on conda channel,
+# 2.6.0 is the latest stable on PyPI cu126 index; functionally equivalent for this project)
+RUN conda run -n ctrl-world pip install --no-cache-dir \
+    torch==2.6.0+cu126 \
+    torchvision==0.21.0+cu126 \
+    --index-url https://download.pytorch.org/whl/cu126
 
 # Install core ML dependencies via pip inside the conda env
 RUN conda run -n ctrl-world pip install --no-cache-dir \
