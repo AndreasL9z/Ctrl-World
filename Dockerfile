@@ -1,9 +1,9 @@
 # ============================================================
 # Ctrl-World: A Controllable Generative World Model
-# Base: CUDA 12.6 + cuDNN 9 + Ubuntu 22.04
+# Base: CUDA 12.6.3 + cuDNN (devel) + Ubuntu 22.04
 # Python 3.11, PyTorch 2.7.1 (via conda, matches local env)
 # ============================================================
-FROM nvidia/cuda:12.6.3-cudnn9-devel-ubuntu22.04
+FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
