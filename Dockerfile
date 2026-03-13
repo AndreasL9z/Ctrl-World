@@ -3,7 +3,7 @@
 # Base: CUDA 12.6.3 + cuDNN (devel) + Ubuntu 22.04
 # Python 3.11, PyTorch 2.7.1 (via conda, matches local env)
 # ============================================================
-FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+FROM --platform=linux/amd64 nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
