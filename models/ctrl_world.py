@@ -6,6 +6,7 @@ from models.unet_spatio_temporal_condition import UNetSpatioTemporalConditionMod
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import einops
 from accelerate import Accelerator
 import datetime
@@ -67,6 +68,57 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
+
+
+def warp_per_camera(latent, flow, num_cams=3):
+    """
+    Warp latent using per-camera optical flow.
+
+    Each camera region [i*H_cam : (i+1)*H_cam] is warped independently
+    to avoid cross-boundary artifacts between camera views.
+
+    Args:
+        latent : (B, C, H_total, W)  latent to warp
+        flow   : (B, 2, H_total, W)  pixel displacement at latent resolution
+                   channel 0 = dx (width), channel 1 = dy (height within cam region)
+    Returns:
+        warped : (B, C, H_total, W)
+    """
+    B, C, H_total, W = latent.shape
+    H_cam = H_total // num_cams
+
+    parts = []
+    for i in range(num_cams):
+        h0, h1 = i * H_cam, (i + 1) * H_cam
+        cam_lat  = latent[:, :, h0:h1, :]   # (B, C, H_cam, W)
+        cam_flow = flow[:, :, h0:h1, :]     # (B, 2, H_cam, W)
+
+        # Base sampling grid in normalized [-1, 1] coordinates
+        gy = torch.linspace(-1, 1, H_cam, device=latent.device, dtype=latent.dtype)
+        gx = torch.linspace(-1, 1, W,     device=latent.device, dtype=latent.dtype)
+        grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')  # (H_cam, W)
+        base = torch.stack([grid_x, grid_y], dim=-1)             # (H_cam, W, 2)
+        base = base.unsqueeze(0).expand(B, -1, -1, -1)           # (B, H_cam, W, 2)
+
+        # Normalize flow: latent-pixel displacement -> [-1,1] offset
+        # cam_flow[:, 0] shape: (B, H_cam, W); stack on dim=-1 -> (B, H_cam, W, 2)
+        # dx normalized by half-width, dy normalized by half-height (within cam region)
+        flow_norm = torch.stack([
+            cam_flow[:, 0] / ((W     - 1) / 2.0),
+            cam_flow[:, 1] / ((H_cam - 1) / 2.0),
+        ], dim=-1)  # (B, H_cam, W, 2)  — already in grid_sample format
+
+        grid = base + flow_norm  # (B, H_cam, W, 2)
+        # grid_sample on CPU doesn't support fp16; cast to float32 then back
+        input_dtype = cam_lat.dtype
+        warped_cam = F.grid_sample(
+            cam_lat.float(), grid.float(),
+            mode='bilinear', padding_mode='border', align_corners=True
+        ).to(input_dtype)
+        parts.append(warped_cam)
+
+    return torch.cat(parts, dim=2)  # (B, C, H_total, W)
+
 
 class Action_encoder2(nn.Module):
     def __init__(self, action_dim, action_num, hidden_size, text_cond=True):
@@ -205,7 +257,75 @@ class CrtlWorld(nn.Module):
         model_pred = self.unet(input_latents, c_noise, encoder_hidden_states=action_hidden, added_time_ids=added_time_ids,frame_level_cond=self.args.frame_level_cond).sample
         predict_x0 = c_out * model_pred + c_skip * noisy_latents 
 
-        # only calculate loss on future frames
-        loss += ((predict_x0[:,num_history:] - latents[:,num_history:])**2 * loss_weight).mean()
+        # =================================================================
+        # Loss：仅对未来帧（future frames）计算，history 帧不参与梯度
+        #
+        # diff shape：[B, T_future, 4, 72, 40]
+        #   T_future = num_frames，4 = latent channels，72 = 3cam×24，40 = W
+        # =================================================================
+        diff = predict_x0[:, num_history:] - latents[:, num_history:]
 
-        return loss, torch.tensor(0.0, device=device,dtype=dtype)
+        # -----------------------------------------------------------------
+        # Seg-mask 空间权重
+        #
+        # batch['seg_weight'] 由 dataset 提供，shape = [B, T_total, 1, 72, 40]
+        #   值域 [0, 1]，前景=1，背景=0（仅是"是否前景"的 binary mask）
+        #
+        # 最终空间权重：spatial_weight = 1.0 + alpha * seg_weight
+        #   背景像素：1.0（与原始 loss 完全相同）
+        #   前景像素：1.0 + alpha（默认 alpha=2.0 → 前景权重=3.0）
+        #
+        # Broadcasting 关系：
+        #   diff           [B, T_future, 4, 72, 40]
+        #   loss_weight    [B, 1,        1,  1,  1]   (EDM 时间权重)
+        #   spatial_weight [B, T_future, 1, 72, 40]   (seg 空间权重，广播到 4 channels)
+        # -----------------------------------------------------------------
+        if 'seg_weight' in batch:
+            # 只取未来帧对应的 seg 权重，与 diff 时间维度对齐
+            seg_w = batch['seg_weight'][:, num_history:]          # [B, T_future, 1, 72, 40]
+            # 转换到与 predict_x0 相同的 dtype（支持 fp16/bf16 混合精度训练）
+            seg_w = seg_w.to(device=device, dtype=diff.dtype)
+            alpha = getattr(self.args, 'seg_loss_alpha', 2.0)
+            spatial_weight = 1.0 + alpha * seg_w                  # [B, T_future, 1, 72, 40]
+        else:
+            # seg_weight 不在 batch 中（兼容旧代码）→ 退化为均匀权重
+            spatial_weight = 1.0
+
+        # Main loss: EDM time weight x spatial weight x per-pixel MSE
+        loss_diffusion = (diff ** 2 * loss_weight * spatial_weight).mean()
+        loss += loss_diffusion
+
+        # -----------------------------------------------------------------
+        # Warping consistency loss (Scheme 2)
+        #
+        # For each consecutive future-frame pair (t, t+1):
+        #   warp(predict_x0[t], flow[t]) should ≈ predict_x0[t+1]
+        #
+        # This forces the model's output to be internally consistent with
+        # the observed motion, complementing the reconstruction loss.
+        #
+        # batch['flow'] shape: [B, num_frames-1, 2, 72, 40]
+        #   flow values are in latent-pixel units (already scaled in dataset)
+        # flow_loss_lambda: default 0.0 (disabled); set e.g. 0.1 to enable
+        # -----------------------------------------------------------------
+        flow_lambda = getattr(self.args, 'flow_loss_lambda', 0.0)
+        loss_flow_raw = torch.tensor(0.0, device=device, dtype=torch.float32)
+        if 'flow' in batch and flow_lambda > 0:
+            flow_data = batch['flow'].to(device=device, dtype=predict_x0.dtype)  # (B, T_pairs, 2, 72, 40)
+            future_preds = predict_x0[:, num_history:]   # (B, num_frames, 4, 72, 40)
+            n_pairs = future_preds.shape[1] - 1
+            if n_pairs > 0:
+                warp_loss = 0.0
+                for t in range(n_pairs):
+                    warped = warp_per_camera(future_preds[:, t], flow_data[:, t])
+                    warp_loss += ((warped - future_preds[:, t + 1]) ** 2).mean()
+                loss_flow_raw = (warp_loss / n_pairs).detach().float()
+                loss += flow_lambda * (warp_loss / n_pairs)
+
+        # Return loss breakdown for wandb monitoring (all detached, no grad needed)
+        loss_info = {
+            'loss_diffusion': loss_diffusion.detach().float(),   # recon loss (with seg weighting)
+            'loss_flow_raw': loss_flow_raw,                      # raw warp MSE (before lambda)
+            'loss_flow_weighted': loss_flow_raw * flow_lambda,   # actual flow contribution to total
+        }
+        return loss, loss_info

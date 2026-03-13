@@ -1,0 +1,49 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+dist/
+build/
+.eggs/
+
+# Large model checkpoints (mount at runtime instead)
+model_ckpt/
+models/Ctrl-World/
+models/svd/
+models/clip-vit-base-patch32/
+
+# Large datasets (mount at runtime instead)
+dataset_DROID/
+dataset_example/libero/
+01-03-BFN-data/
+01-03-BFN-data.zip
+
+# Synthetic trajectories output
+synthetic_traj/
+
+# Logs and experiment tracking
+wandb/
+swanlog/
+slurm_out/
+*.txt
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# IDE and OS
+.vscode/
+.cursor/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log

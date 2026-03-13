@@ -23,31 +23,56 @@ class wm_args:
     prob=[1.0]
     annotation_name='annotation' #'annotation_all_skip1'
     num_workers=4
-    down_sample=1 # DROID: downsample 15hz to 5hz (state/video ratio). LIBERO with frame_skip=4 should use down_sample=1
+    down_sample=1 # DROID: downsample 15hz to 5hz (state/video ratio).
     skip_step = 1
+
+    # -----------------------------------------------------------------------
+    # Seg-mask spatial loss weighting
+    #   seg_root_path : 指向预计算好的 per-object binary mask 目录，结构为
+    #                   {seg_root_path}/{train|val}/{episode_id}/{cam_id}.pt
+    #                   每个 .pt 的 shape 为 [T_seg, C, 192, 320]（float32，0/1）
+    #                   若为 None 则不启用此 loss，退化为原始均匀权重 MSE
+    #   seg_loss_alpha: 前景区域的额外权重系数
+    #                   最终空间权重 = 1.0 + seg_loss_alpha * mask
+    #                   背景像素权重=1.0，前景像素权重=1+alpha（例如 alpha=2 → 前景3倍）
+    # -----------------------------------------------------------------------
+    seg_root_path = None   # e.g. '/scr2/shared/world_model/libero_seg2'
+    seg_loss_alpha = 2.0   # foreground weight amplifier
+
+    # -----------------------------------------------------------------------
+    # Optical flow warping consistency loss (Scheme 2)
+    #   flow_root_path : 指向预计算好的 optical flow 目录，结构为
+    #                    {flow_root_path}/{train|val}/{episode_id}/{cam_id}.pt
+    #                    每个 .pt 的 shape 为 [T_flow, 2, 256, 256]（float32，像素位移）
+    #                    若为 None 则不启用此 loss
+    #   flow_loss_lambda: warp loss 权重
+    #                    total_loss = diffusion_loss + flow_loss_lambda * warp_loss
+    # -----------------------------------------------------------------------
+    flow_root_path = None   # e.g. '/scr2/shared/world_model/libero_optical_flow'
+    flow_loss_lambda = 0.1  # warping loss weight
     
 
     # logs parameters
     debug = False
-    tag = 'doird_subset'
+    tag = 'libero_seq_3_seg_loss_flow_loss'  # Changed from 'doird_subset' for LIBERO training
     output_dir = f"model_ckpt/{tag}"
     wandb_run_name = tag
-    wandb_project_name = "droid_example"
+    wandb_project_name = "ctrl_world_libero"  # Changed from "droid_example"
 
 
     # training parameters
     learning_rate= 1e-5 # 5e-6
     gradient_accumulation_steps = 1
     mixed_precision = 'fp16'
-    train_batch_size = 2
+    train_batch_size = 3
     shuffle = True
-    num_train_epochs = 10
-    max_train_steps = 10000
-    checkpointing_steps = 2000
-    validation_steps = 250
+    num_train_epochs = 5          # 主终止条件：跑几个 epoch
+    max_train_steps = 999_999_999 # 安全上限（极大值=实际不生效，以 epoch 为准）
+    checkpointing_steps = 5000
+    validation_steps = 1000
     max_grad_norm = 1.0
     # for val
-    video_num= 10
+    video_num = 10
 
     ############################ model args ##############################
 
@@ -60,8 +85,8 @@ class wm_args:
     width = 320
     height = 192
     # num history and num future predictions
-    num_frames= 5
-    num_history = 6
+    num_frames= 3
+    num_history = 3
     action_dim = 7
     text_cond = True
     frame_level_cond = True
@@ -75,16 +100,16 @@ class wm_args:
     task_type: str = "pickplace" # choose from ['pickplace', 'towel_fold', 'wipe_table', 'tissue', 'close_laptop','tissue','drawer','stack']
     gripper_max_dict = {'replay':1.0, 'pickplace':0.75, 'towel_fold':0.95, 'wipe_table':0.95, 'tissue':0.97, 'close_laptop':0.95,'drawer':0.75,'stack':0.75,}
     ##############################################################################
-    policy_type = 'pi05' # choose from ['pi05', 'pi0', 'pi0fast']
+    policy_type = 'pi05_libero' # choose from ['pi05', 'pi0', 'pi0fast']
     action_adapter = 'models/action_adapter/model2_15_9.pth' # adapat action from joint vel to cartesian pose
-    pred_step = 5 # predict 5 steps (1s) action each time
-    policy_skip_step = 2 # horizon = (pred_step-1) * policy_skip_step
-    interact_num = 12 # number of interactions (each interaction contains pred_step steps)
+    pred_step = 3 # predict 3 steps action each time (must equal num_frames)
+    policy_skip_step = 3 # horizon = (pred_step-1) * policy_skip_step
+    interact_num = 24 # number of interactions (each interaction contains pred_step steps)
 
     # wm
     data_stat_path = 'dataset_meta_info/droid/stat.json'
     val_model_path = ckpt_path
-    history_idx = [0,0,-12,-9,-6,-3]
+    history_idx = [0,-6,-3]
 
     # save
     save_dir = 'synthetic_traj'
@@ -108,11 +133,12 @@ class wm_args:
 
         elif self.task_type == "replay_libero":
             self.val_dataset_dir = "dataset_example/libero"
-            self.val_id = ["99", "199", "299"]
+            self.val_id = ["99","199","299","399","499","599","699","799","899","999"]
             self.start_idx = [0] * len(self.val_id)
             self.instruction = [""] * len(self.val_id)
-            self.task_name = "Rollouts_replay_libero"
+            self.task_name = "Rollouts_replay_libero_seq_3_seg_loss_flow_loss_new"
             self.data_stat_path = "dataset_meta_info/libero/stat.json"
+            self.action_dim = 8
 
         elif self.task_type == "keyboard":
             self.val_dataset_dir = "dataset_example/droid_subset"
@@ -177,17 +203,20 @@ class wm_args:
             self.instruction = ["stack the blue block on the red block"] * len(self.val_id)
 
         elif self.task_type == "interact_libero":
-            self.interact_num = 15
+            self.interact_num = 30
             self.val_dataset_dir = "dataset_example/libero"
-            self.val_id = ["99", "199", "299"]
+            self.val_id = ["99", "199", "299", "399", "499", "599"]
             self.start_idx = [0] * len(self.val_id)
             self.instruction = [
                 "put the yellow and white mug in the microwave and close it",
                 "put both the alphabet soup and the tomato sauce in the basket",
                 "pick up the book and place it in the back compartment of the caddy",
             ]
-            self.task_name = "Rollouts_interact_libero"
+            self.task_name = "Rollouts_interact_libero_seq_3"
             self.data_stat_path = "dataset_meta_info/libero/stat.json"
+            self.action_dim = 8
+            self.policy_type = 'pi05_libero'
+            self.action_adapter = 'models/action_adapter/output_libero/model_libero_10_19.pth'
         
         else:
             raise ValueError(f"Unknown task type: {self.task_type}")

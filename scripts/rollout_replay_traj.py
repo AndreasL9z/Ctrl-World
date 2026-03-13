@@ -32,6 +32,32 @@ import swanlab
 import mediapy
 import sys
 from scipy.spatial.transform import Rotation as R
+from skimage.metrics import structural_similarity
+from scipy.linalg import sqrtm
+
+try:
+    import lpips as lpips_lib
+    HAS_LPIPS = True
+except ImportError:
+    HAS_LPIPS = False
+
+try:
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    HAS_FID = True
+except ImportError:
+    HAS_FID = False
+
+try:
+    from torchvision.models.video import r3d_18, R3D_18_Weights
+    HAS_R3D = True
+except ImportError:
+    try:
+        from torchvision.models.video import r3d_18  # older torchvision without Weights enum
+        HAS_R3D = True
+        R3D_18_Weights = None
+    except ImportError:
+        HAS_R3D = False
+        R3D_18_Weights = None
 
 
 
@@ -61,7 +87,7 @@ class agent():
 
         # load ctrl-world model        
         self.model = CrtlWorld(args)
-        self.model.load_state_dict(torch.load(args.val_model_path))
+        self.model.load_state_dict(torch.load(args.val_model_path, weights_only=False))
         self.model.to(self.accelerator.device).to(self.dtype)
         self.model.eval()
         print("load world model success")
@@ -100,15 +126,17 @@ class agent():
         frames_ids = np.min([frames_ids, max_ids], axis=0).astype(int)
         print("Ground truth frames ids", frames_ids)
 
-        # get action and joint pos
+        # get action (cartesian states) and joint pos
         instruction = anno['texts'][0]
-        car_action = np.array(anno['states'])
+        car_action = np.array(anno['states'])  # Cartesian states: [xyz, euler, gripper]
         car_action = car_action[frames_ids]
         if 'joints' in anno:
+            # DROID: has separate 'joints' field for joint angles
             joint_pos = np.array(anno['joints'])
         else:
-            # LIBERO format has no 'joints' field, states itself is joint angles + gripper
-            joint_pos = np.array(anno['states'])
+            # LIBERO: no 'joints' field, 'states' contains cartesian states (xyz+euler+gripper)
+            # Note: variable name 'joint_pos' is misleading for LIBERO - it's actually cartesian states
+            joint_pos = np.array(anno['states'])  # Actually cartesian states for LIBERO
         joint_pos = joint_pos[frames_ids]
 
         # get videos
@@ -221,7 +249,227 @@ class agent():
 
         return videos_cat, true_video, videos, latents  # np.uint8:(3, 8, 128, 256, 3) or (3, 8, 192, 320, 3)
 
-        
+
+# ---------------------------------------------------------------------------
+# Video Quality Metrics
+# ---------------------------------------------------------------------------
+class VideoMetrics:
+    """
+    Accumulates and computes video quality metrics across multiple trajectories:
+      MSE, PSNR, SSIM, LPIPS, UIQI  – computed per-frame, averaged over all calls
+      FID                            – Fréchet Inception Distance over all frames
+      FVD                            – Fréchet Video Distance via R3D-18 features
+
+    Usage:
+        tracker = VideoMetrics(device)
+        tracker.update(real_np, pred_np)   # (V, T, H, W, 3) uint8, call per step
+        results = tracker.print_results()  # prints + returns dict
+    """
+
+    def __init__(self, device: torch.device, compute_fid: bool = True, compute_fvd: bool = True):
+        self.device = device
+
+        # per-step scalar accumulators
+        self.mse_scores:   list[float] = []
+        self.psnr_scores:  list[float] = []
+        self.ssim_scores:  list[float] = []
+        self.lpips_scores: list[float] = []
+        self.uiqi_scores:  list[float] = []
+
+        # LPIPS
+        self.lpips_fn = None
+        if HAS_LPIPS:
+            self.lpips_fn = lpips_lib.LPIPS(net='alex').to(device).eval()
+            print("[VideoMetrics] LPIPS initialised.")
+        else:
+            print("[VideoMetrics] lpips not installed – LPIPS skipped.")
+
+        # FID (torchmetrics)
+        self.fid_metric = None
+        if compute_fid and HAS_FID:
+            self.fid_metric = FrechetInceptionDistance(feature=2048).to(device)
+            print("[VideoMetrics] FID initialised.")
+        elif compute_fid:
+            print("[VideoMetrics] torchmetrics not installed – FID skipped.")
+
+        # FVD backbone: R3D-18 (torchvision)
+        self.r3d_model = None
+        self.real_video_feats: list = []
+        self.pred_video_feats: list = []
+        if compute_fvd and HAS_R3D:
+            try:
+                self.r3d_model = r3d_18(weights=R3D_18_Weights.DEFAULT if R3D_18_Weights else None)
+            except Exception:
+                self.r3d_model = r3d_18(pretrained=True)
+            self.r3d_model.fc = nn.Identity()
+            self.r3d_model = self.r3d_model.to(device).eval()
+            print("[VideoMetrics] FVD backbone (R3D-18) initialised.")
+        elif compute_fvd:
+            print("[VideoMetrics] torchvision video models not available – FVD skipped.")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def update(self, real_videos: np.ndarray, pred_videos: np.ndarray):
+        """
+        Update all metrics with one batch of ground-truth / predicted videos.
+
+        Args:
+            real_videos: uint8 ndarray of shape (V, T, H, W, 3)
+            pred_videos: uint8 ndarray of shape (V, T, H, W, 3)
+        """
+        V, T, H, W, _ = real_videos.shape
+        real_flat = real_videos.reshape(V * T, H, W, 3).astype(np.float32)
+        pred_flat = pred_videos.reshape(V * T, H, W, 3).astype(np.float32)
+
+        # --- MSE & PSNR ---
+        diff = real_flat - pred_flat
+        mse = float(np.mean(diff ** 2))
+        self.mse_scores.append(mse)
+        psnr = 20.0 * np.log10(255.0 / (np.sqrt(mse) + 1e-8)) if mse > 0 else float('inf')
+        self.psnr_scores.append(float(psnr))
+
+        # --- SSIM (per-frame average) ---
+        ssim_vals = []
+        for r, p in zip(real_flat.astype(np.uint8), pred_videos.reshape(V * T, H, W, 3)):
+            try:
+                s = structural_similarity(r, p, channel_axis=-1, data_range=255)
+            except TypeError:   # scikit-image < 0.19
+                s = structural_similarity(r, p, multichannel=True, data_range=255)
+            ssim_vals.append(s)
+        self.ssim_scores.append(float(np.mean(ssim_vals)))
+
+        # --- LPIPS (per-frame average) ---
+        if self.lpips_fn is not None:
+            real_t = torch.from_numpy(real_flat).permute(0, 3, 1, 2).to(self.device) / 127.5 - 1.0
+            pred_t = torch.from_numpy(pred_flat).permute(0, 3, 1, 2).to(self.device) / 127.5 - 1.0
+            self.lpips_scores.append(float(self.lpips_fn(real_t, pred_t).mean().item()))
+
+        # --- UIQI (per-frame average) ---
+        uiqi_vals = [
+            self._uiqi(real_flat[i].astype(np.float64), pred_flat[i].astype(np.float64))
+            for i in range(len(real_flat))
+        ]
+        self.uiqi_scores.append(float(np.mean(uiqi_vals)))
+
+        # --- FID feature update ---
+        if self.fid_metric is not None:
+            real_u8 = torch.from_numpy(real_flat.astype(np.uint8)).permute(0, 3, 1, 2).to(self.device)
+            pred_u8 = torch.from_numpy(pred_flat.astype(np.uint8)).permute(0, 3, 1, 2).to(self.device)
+            self.fid_metric.update(real_u8, real=True)
+            self.fid_metric.update(pred_u8, real=False)
+
+        # --- FVD feature update ---
+        if self.r3d_model is not None:
+            self._extract_fvd_features(real_videos, pred_videos)
+
+    def get_results(self) -> dict:
+        results = {}
+        if self.mse_scores:
+            results['MSE']  = float(np.mean(self.mse_scores))
+            results['PSNR'] = float(np.mean(self.psnr_scores))
+        if self.ssim_scores:
+            results['SSIM'] = float(np.mean(self.ssim_scores))
+        if self.lpips_scores:
+            results['LPIPS'] = float(np.mean(self.lpips_scores))
+        if self.uiqi_scores:
+            results['UIQI'] = float(np.mean(self.uiqi_scores))
+        if self.fid_metric is not None:
+            try:
+                results['FID'] = float(self.fid_metric.compute().item())
+            except Exception as e:
+                print(f"[VideoMetrics] FID compute() failed: {e}")
+        fvd = self._compute_fvd()
+        if fvd is not None:
+            results['FVD'] = fvd
+        return results
+
+    def print_results(self) -> dict:
+        results = self.get_results()
+        print("\n" + "=" * 52)
+        print("  Video Quality Metrics (aggregated over all steps)")
+        print("=" * 52)
+        labels = {
+            'MSE':   'MSE   (↓)',
+            'PSNR':  'PSNR  (↑, dB)',
+            'SSIM':  'SSIM  (↑)',
+            'LPIPS': 'LPIPS (↓)',
+            'UIQI':  'UIQI  (↑)',
+            'FID':   'FID   (↓)',
+            'FVD':   'FVD   (↓)',
+        }
+        for key, label in labels.items():
+            if key in results:
+                print(f"  {label:<20s}: {results[key]:.4f}")
+        print("=" * 52 + "\n")
+        return results
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _uiqi(self, real: np.ndarray, pred: np.ndarray) -> float:
+        """Universal Image Quality Index for a single H×W×3 pair (float64)."""
+        channel_qs = []
+        for c in range(real.shape[-1]):
+            r, p = real[..., c].ravel(), pred[..., c].ravel()
+            mu_r, mu_p = r.mean(), p.mean()
+            var_r,  var_p  = r.var(), p.var()
+            cov_rp = np.mean((r - mu_r) * (p - mu_p))
+            denom  = (var_r + var_p) * (mu_r ** 2 + mu_p ** 2)
+            if denom < 1e-8:
+                channel_qs.append(1.0 if np.allclose(r, p) else 0.0)
+            else:
+                channel_qs.append((4.0 * cov_rp * mu_r * mu_p) / denom)
+        return float(np.mean(channel_qs))
+
+    def _extract_fvd_features(self, real_videos: np.ndarray, pred_videos: np.ndarray):
+        """Extract R3D-18 clip features (one feature vector per view per video)."""
+        # R3D-18 Kinetics normalisation
+        mean = torch.tensor([0.43216, 0.394666, 0.37645], device=self.device).view(1, 3, 1, 1, 1)
+        std  = torch.tensor([0.22803,  0.22145, 0.216989], device=self.device).view(1, 3, 1, 1, 1)
+        V, T, H, W, _ = real_videos.shape
+
+        for v in range(V):
+            for src_np, feat_list in [(real_videos[v], self.real_video_feats),
+                                      (pred_videos[v], self.pred_video_feats)]:
+                # (T, H, W, 3) → (1, 3, T, H, W)
+                x = torch.from_numpy(src_np).permute(3, 0, 1, 2).float().to(self.device) / 255.0
+                x = x.unsqueeze(0)
+                x = (x - mean) / std
+                # R3D-18 spatial input should be 112×112
+                if H != 112 or W != 112:
+                    B, C, T_, H_, W_ = x.shape
+                    x = x.permute(0, 2, 1, 3, 4).reshape(B * T_, C, H_, W_)
+                    x = F.interpolate(x, size=(112, 112), mode='bilinear', align_corners=False)
+                    x = x.reshape(B, T_, C, 112, 112).permute(0, 2, 1, 3, 4)
+                with torch.no_grad():
+                    feat = self.r3d_model(x).cpu().numpy()  # (1, feat_dim)
+                feat_list.append(feat)
+
+    def _compute_fvd(self):
+        """Compute Fréchet distance over accumulated R3D-18 features."""
+        if not self.real_video_feats:
+            return None
+        real_f = np.concatenate(self.real_video_feats, axis=0)
+        pred_f = np.concatenate(self.pred_video_feats, axis=0)
+        mu_r, mu_p = real_f.mean(0), pred_f.mean(0)
+        if len(real_f) > 1:
+            sig_r = np.cov(real_f, rowvar=False)
+            sig_p = np.cov(pred_f, rowvar=False)
+        else:
+            d = real_f.shape[1]
+            sig_r = np.zeros((d, d))
+            sig_p = np.zeros((d, d))
+        diff = mu_r - mu_p
+        covmean = sqrtm(sig_r @ sig_p)
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+        return float(np.dot(diff, diff) + np.trace(sig_r + sig_p - 2 * covmean))
+
+
 if __name__ == "__main__":
     from config import wm_args
     from argparse import ArgumentParser
@@ -248,6 +496,8 @@ if __name__ == "__main__":
 
     # create rollout agent
     Agent = agent(args)
+    eval_start_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    metrics_tracker = VideoMetrics(Agent.device)
     interact_num = args.interact_num
     pred_step = args.pred_step
     num_history = args.num_history
@@ -302,8 +552,8 @@ if __name__ == "__main__":
             print("################ world model forward ################")
             print(f'traj_id:{val_id_i}, interact step: {i}/{interact_num}')
             # retrive history cond and action cond
-            history_idx = [0,0,-8,-6,-4,-2]
-            his_pose = np.concatenate([his_eef[idx] for idx in history_idx], axis=0)  # (6, action_dim)
+            history_idx = args.history_idx
+            his_pose = np.concatenate([his_eef[idx] for idx in history_idx], axis=0)  # (num_history, action_dim)
             action_cond = np.concatenate([his_pose, cartesian_pose], axis=0)
             his_cond_input = torch.cat([his_cond[idx] for idx in history_idx], dim=0).unsqueeze(0)
             current_latent = his_cond[-1]  # (1, 4, 72, 40)
@@ -312,6 +562,7 @@ if __name__ == "__main__":
             assert his_cond_input.shape == (1, int(num_history), 4, 72, 40), f"Expected his_cond_input shape (1, {int(num_history)}, 72, 40), got {his_cond_input.shape}"
             # forward world model
             videos_cat, true_videos, video_dict_pred, predicted_latents = Agent.forward_wm(action_cond, video_latent_true, current_latent, his_cond=his_cond_input,text=text_i if Agent.args.text_cond else None)
+            metrics_tracker.update(true_videos, video_dict_pred)
 
             print("################ record information ################")
             # push current step to history buffer
@@ -335,6 +586,14 @@ if __name__ == "__main__":
         mediapy.write_video(filename_video, video, fps=4)
         print(f"Saving video to {filename_video}")
         print("##########################################################################")
+
+    # ---- final aggregated metrics across all trajectories / steps ----
+    final_metrics = metrics_tracker.print_results()
+    metrics_save_path = f"{args.save_dir}/{args.task_name}/metrics_{eval_start_time}.json"
+    os.makedirs(os.path.dirname(metrics_save_path), exist_ok=True)
+    with open(metrics_save_path, 'w') as f:
+        json.dump(final_metrics, f, indent=2)
+    print(f"Metrics saved to {metrics_save_path}")
 
 
 # CUDA_VISIBLE_DEVICES=0 python rollout_replay_traj.py

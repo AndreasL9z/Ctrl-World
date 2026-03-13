@@ -2,7 +2,7 @@
 from openpi.training import config as config_pi
 from openpi.policies import policy_config
 from openpi_client import image_tools
-# from openpi.shared import download
+from openpi.shared import download
 
 import numpy as np
 
@@ -47,23 +47,28 @@ class agent():
         self.dtype = args.dtype
 
         # load pi policy
-        if 'pi05' in args.policy_type:
+        if 'pi05_libero' in args.policy_type:
+            config = config_pi.get_config("pi05_libero")
+            print("load pi05_libero policy")
+            checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_libero")
+        elif 'pi05' in args.policy_type:
             config = config_pi.get_config("pi05_droid")
-            # checkpoint_dir = '/cephfs/shared/llm/openpi/openpi-assets-preview/checkpoints/pi05_droid' 
+            checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_droid")
         elif 'pi0fast' in args.policy_type:
             config = config_pi.get_config("pi0fast_droid")
-            # checkpoint_dir = '/cephfs/shared/llm/openpi/openpi-assets/checkpoints/pi0fast_droid'
+            checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi0fast_droid")
         elif 'pi0' in args.policy_type:
             config = config_pi.get_config("pi0_droid")
-            # checkpoint_dir = '/cephfs/shared/llm/openpi/openpi-assets/checkpoints/pi0_droid'
+            checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi0_droid")
         else:
             raise ValueError(f"Unknown policy type: {args.policy_type}")
-        self.policy = policy_config.create_trained_policy(config, args.pi_ckpt)
+
+        self.policy = policy_config.create_trained_policy(config, checkpoint_dir)
 
         # load ctrl-world model
 
         self.model = CrtlWorld(args)
-        self.model.load_state_dict(torch.load(args.val_model_path))
+        self.model.load_state_dict(torch.load(args.val_model_path, weights_only=False))
         self.model.to(self.accelerator.device).to(self.dtype)
         self.model.eval()
         print("load world model success")
@@ -74,9 +79,28 @@ class agent():
         
         # Since the official Pi-Droid model output joint velocity, and crtl-world is train on cartesian space, we need to load an light-weight adapter to transform joint velocity action into cartesian pose action. 
         if args.action_adapter is not None:
-            from models.action_adapter.train2 import Dynamics
-            self.dynamics_model = Dynamics(action_dim=7, action_num=15, hidden_size=512).to(self.device)
-            self.dynamics_model.load_state_dict(torch.load(args.action_adapter, map_location=self.device))        
+            if 'libero' in args.policy_type:
+                # LIBERO: adapter maps (state_8d, policy_action_7d) → future absolute cartesian states
+                from models.action_adapter.train_libero import Dynamics_LIBERO
+                print("Loading LIBERO action adapter: state_dim=8, action_dim=7, action_num=10")
+                self.dynamics_model = Dynamics_LIBERO(state_dim=8, action_dim=7, action_num=10, hidden_size=512).to(self.device)
+                ckpt = torch.load(args.action_adapter, map_location=self.device, weights_only=False)
+                if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+                    self.dynamics_model.load_state_dict(ckpt['state_dict'])
+                    self.dynamics_model.update_normalization_stats(
+                        ckpt['action_01'], ckpt['action_99'],
+                        ckpt['delta_01'],  ckpt['delta_99'],
+                    )
+                else:
+                    self.dynamics_model.load_state_dict(ckpt)
+                    print("Warning: checkpoint has no normalization stats, using hardcoded defaults")
+                print(f"Loaded LIBERO action adapter from {args.action_adapter}")
+            else:
+                # DROID: adapter maps joint velocity (7-dim) → future joint pos → FK → cartesian
+                from models.action_adapter.train2 import Dynamics
+                print("Loading DROID action adapter: action_dim=7, action_num=15")
+                self.dynamics_model = Dynamics(action_dim=7, action_num=15, hidden_size=512).to(self.device)
+                self.dynamics_model.load_state_dict(torch.load(args.action_adapter, map_location=self.device, weights_only=False))        
 
     def normalize_bound(
         self,
@@ -110,7 +134,10 @@ class agent():
         instruction = anno['texts'][0]
         car_action = np.array(anno['states'])
         car_action = car_action[frames_ids]
-        joint_pos = np.array(anno['joints'])
+        if 'joints' in anno:
+            joint_pos = np.array(anno['joints'])
+        else:
+            joint_pos = np.array(anno['states'])
         joint_pos = joint_pos[frames_ids]
 
         # get videos
@@ -236,36 +263,73 @@ class agent():
         image2 = torch.nn.functional.interpolate(image2.permute(2, 0, 1).unsqueeze(0).float(), size=(180, 320), mode='bilinear', align_corners=False).squeeze(0).permute(1, 2, 0).to(torch.uint8)
         image1 = image1.numpy()  # convert back to numpy array
         image2 = image2.numpy()  # convert back to numpy array
-        example = {
-            "observation/exterior_image_1_left": image_tools.resize_with_pad(image1, 224, 224),
-            "observation/wrist_image_left": image_tools.resize_with_pad(image2, 224, 224),
-            "observation/joint_position": joints[:7],
-            "observation/gripper_position": joints[-1:],
-            "prompt": text,
-        }
-        action_chunk = self.policy.infer(example)["actions"] #(10,8) velocity
+        
+        # Construct input example based on policy type
+        if 'libero' in self.args.policy_type:
+            # LIBERO policy format
+            example = {
+                "observation/image": image_tools.resize_with_pad(image1, 224, 224),
+                "observation/wrist_image": image_tools.resize_with_pad(image2, 224, 224),
+                "observation/state": joints,  # 8-dimensional state (7 joints + gripper)
+                "prompt": text,
+            }
+        else:
+            # DROID policy format
+            example = {
+                "observation/exterior_image_1_left": image_tools.resize_with_pad(image1, 224, 224),
+                "observation/wrist_image_left": image_tools.resize_with_pad(image2, 224, 224),
+                "observation/joint_position": joints[:7],
+                "observation/gripper_position": joints[-1:],
+                "prompt": text,
+            }
+        action_chunk = self.policy.infer(example)["actions"] #(10,7) for libero / (10,8) for droid
 
-        # action adapater
+        action_len = action_chunk.shape[0]
+        skip = self.args.policy_skip_step
+        valid_num = int(skip*(self.args.pred_step-1))
+
+        if 'libero' in self.args.policy_type:
+            # LIBERO: adapter maps (current_state_8d, policy_action_7d) → future absolute cartesian states
+            current_state = joints[None, :8]  # (1, 8)
+            # adapter expects (action_num, 7); pad/trim to exactly action_num=10
+            action_num = self.dynamics_model.action_num  # 10
+            if action_len < action_num:
+                pad = np.repeat(action_chunk[-1:], action_num - action_len, axis=0)
+                action_chunk_in = np.concatenate([action_chunk, pad], axis=0)
+            else:
+                action_chunk_in = action_chunk[:action_num]
+            # adapter: (1,8), (10,7) → (10,8) absolute future states
+            future_states = self.dynamics_model(current_state, action_chunk_in, None, training=False)
+            # prepend current state for history continuity
+            cartesian_states = np.concatenate([current_state, future_states], axis=0)[:15]  # (15, 8)
+            policy_in_out = {
+                'joint_pos': cartesian_states[:valid_num],
+                'joint_vel': action_chunk_in[:valid_num],
+                'state_fk':  cartesian_states[:valid_num],
+            }
+            state_fk_skip  = cartesian_states[::skip][:self.args.pred_step]  # (pred_step, 8)
+            joint_pos_skip = state_fk_skip
+            return policy_in_out, joint_pos_skip, state_fk_skip
+
+        # DROID: policy outputs joint velocity (7) + gripper (1) = 8-dim
         current_joint = joints[None,:][:,:7]
         current_gripper = joints[None,:][:,7:]
         if 'pi05' in self.args.policy_type:
-            idx = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14]  # for dynamics model, we need 15 steps
+            idx = list(range(action_len)) + [action_len - 1] * max(0, 15 - action_len)
         else:
             idx = [0,1,2,3,4,5,6,7,8,9,9,9,9,9,9]
-        # policy output joint velocity and gripper position
-        joint_vel = action_chunk[:,:7] # (15, 7)
-        gripper_pos = action_chunk[:,7:] # (15, 1)
+        joint_vel = action_chunk[:,:7]  # (N, 7)
+        gripper_pos = action_chunk[:,7:]  # (N, 1)
         joint_vel = joint_vel[idx]  # (15, 7)
         gripper_pos = gripper_pos[idx]  # (15, 1)
         gripper_max = self.args.gripper_max
         gripper_pos = np.clip(gripper_pos, 0, gripper_max)
-        # calculate future joint positions
-        joint_pos = self.dynamics_model(current_joint, joint_vel,None, training=False)
-        # fk
+        # calculate future joint positions via dynamics model
+        joint_pos = self.dynamics_model(current_joint, joint_vel, None, training=False)
+        # FK: joint pos -> cartesian state
         state_fk = []
         joint_pos = np.concatenate([current_joint, joint_pos], axis=0)[:15]  # (15, 7)
         gripper_pos = np.concatenate([current_gripper, gripper_pos], axis=0)[:15]  # (15, 1)
-        joint_vel = joint_vel  # (15, 7)
         for i in range(joint_pos.shape[0]):
             current_state_fk = get_fk_solution(joint_pos[i,:7])
             xyz = current_state_fk[:3, 3]
@@ -273,19 +337,16 @@ class agent():
             r = R.from_matrix(rotation_matrix)
             euler = r.as_euler('xyz') 
             state_fk.append(np.concatenate([xyz, euler, gripper_pos[i]], axis=0))
-        state_fk = np.array(state_fk) # (15,7)
+        state_fk = np.array(state_fk)  # (15, 7)
 
-        # prepare output
-        skip = self.args.policy_skip_step
-        valid_num = int(skip*(self.args.pred_step-1))
         policy_in_out = {
             'joint_pos': joint_pos[:valid_num],  # (12, 7)
-            'joint_vel': joint_vel[:valid_num],  # (12, 7)
-            'state_fk': state_fk[:valid_num],  # (12, 7)
+            'joint_vel': joint_vel[:valid_num],   # (12, 7)
+            'state_fk': state_fk[:valid_num],     # (12, 7)
         }
-        state_fk_skip = state_fk[::skip][:self.args.pred_step]  # (5, 7)
-        joint_pos_skip = joint_pos[::skip][:self.args.pred_step]  # (5, 7)
-        joint_pos_skip = np.concatenate([joint_pos_skip, state_fk_skip[:,-1:]], axis=-1) # (5, 8) add gripper pos
+        state_fk_skip = state_fk[::skip][:self.args.pred_step]  # (pred_step, 7)
+        joint_pos_skip = joint_pos[::skip][:self.args.pred_step]  # (pred_step, 7)
+        joint_pos_skip = np.concatenate([joint_pos_skip, state_fk_skip[:,-1:]], axis=-1)  # (pred_step, 8)
 
         return policy_in_out, joint_pos_skip, state_fk_skip
 

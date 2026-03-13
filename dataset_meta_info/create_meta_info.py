@@ -60,9 +60,10 @@ if __name__ == "__main__":
 
     from argparse import ArgumentParser
     parser = ArgumentParser()
-    parser.add_argument('--droid_output_path', type=str, default='dataset_example/droid_subset')
-    # dataset_name
-    parser.add_argument('--dataset_name', type=str, default='droid_subset')
+    parser.add_argument('--droid_output_path', type=str, default='dataset_example/droid_subset',
+                       help='Path to processed dataset (e.g., dataset_example/libero)')
+    parser.add_argument('--dataset_name', type=str, default='droid_subset',
+                       help='Dataset name for meta_info directory (e.g., libero)')
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
     
@@ -93,12 +94,14 @@ if __name__ == "__main__":
 
             state_all = np.array(state_all)
             print(f'state_all shape: {state_all.shape}')
+            print(f'state dimension: {state_all.shape[-1]} (DROID=7, LIBERO=8)')
             state_all = state_all.reshape(-1, state_all.shape[-1])
             # calculate the 1% and 99% percentile for normalization
             state_01 = np.percentile(state_all, 1, axis=0)
             state_99 = np.percentile(state_all, 99, axis=0)
             print('state_01:', state_01)
             print('state_99:', state_99)
+            print(f'State range: min={state_all.min(axis=0)}, max={state_all.max(axis=0)}')
             stat = {
                 'state_01': state_01.tolist(),
                 'state_99': state_99.tolist(),

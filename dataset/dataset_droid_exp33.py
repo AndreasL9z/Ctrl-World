@@ -145,8 +145,17 @@ class Dataset_mix(Dataset):
             label = json.load(f)
             
         # since we downsample the video from 15hz to 5 hz to save the storage space, the frame id is 1/3 of the state id
-        joint_len = len(label['observation.state.joint_position'])-1
-        frame_len = np.floor(joint_len / 3)
+        # For DROID: use observation.state.joint_position length
+        # For LIBERO: use the 'states' or 'observation.state' length directly
+        if 'observation.state.joint_position' in label:
+            # DROID: original state length (before downsampling)
+            joint_len = len(label['observation.state.joint_position'])-1
+            frame_len = np.floor(joint_len / 3)
+        elif 'states' in label:
+            # LIBERO: already downsampled states, video_length gives frame count
+            frame_len = label['video_length'] - 1
+        else:
+            raise ValueError("Cannot determine trajectory length from annotation")
         skip = random.randint(1, 2)
         skip_his = int(skip*4)
         p = random.random()
@@ -186,10 +195,194 @@ class Dataset_mix(Dataset):
         latent[:,:,48:72] = latnt_cond3
         data['latent'] = latent.float()
 
+        # =================================================================
+        # Seg-mask spatial weight（用于训练 loss 的前景区域加权）
+        #
+        # 背景：seg mask 文件保存在 {seg_root_path}/{train|val}/{episode_id}/{cam_id}.pt
+        #       每个文件 shape = [T_seg, C, 192, 320]，dtype=float32，值域 {0, 1}
+        #       C = 该帧检测到的 object 数量（各轨迹不同）
+        #
+        # 时间对齐说明：
+        #   seg 是从原始视频（raw_length 帧）以约 stride=5 计算的，
+        #   而视频帧（video_length）是以约 stride=2 从原始帧采样的，
+        #   因此 T_seg ≈ video_length / 2.5，二者帧率不同。
+        #   映射公式：seg_idx = round(video_frame_idx * T_seg / video_length)
+        #
+        # 空间对齐说明：
+        #   seg 与视频同为 192×320 分辨率，VAE 将 192×320 → 24×40（8× 下采样）。
+        #   因此把 seg 做同等 bilinear 下采样到 24×40 即可与 latent 空间对齐。
+        #
+        # 返回：data['seg_weight'] shape = [T_total, 1, 72, 40]
+        #   72 = 3 相机各 24 行垂直拼接，与 latent 的 H 维度严格对应：
+        #     cam0 → rows [0:24], cam1 → rows [24:48], cam2 → rows [48:72]
+        #   值域 [0, 1]，前景=1，背景=0；
+        #   在 model 的 loss 中会转为 1.0 + alpha * seg_weight 作为权重。
+        # =================================================================
+        T_total = self.args.num_history + self.args.num_frames
+        seg_root = getattr(self.args, 'seg_root_path', None)
+
+        if seg_root is not None:
+            # 获取视频总帧数，用于帧索引映射
+            # LIBERO annotation 含 'video_length'，DROID 不含（DROID 无 seg 文件，会走 except）
+            video_length = label.get('video_length', max(rgb_id) + 1)
+
+            cam_masks = []  # 存储 3 个相机各自下采样后的 mask
+            for cam_id in [0, 1, 2]:
+                # LIBERO 只有两路真实相机（cam0=agentview, cam1=wrist）
+                # cam2 在 latent 中是全黑零填充（见 extract_latent_libero_new.py），
+                # 对应位置没有真实图像内容，不应施加任何前景权重。
+                # 虽然 seg2 目录里存在 2.pt（内容是 cam0 的副本），但直接忽略，
+                # 强制置零以保证与 latent 的语义一致。
+                if cam_id == 2:
+                    cam_masks.append(torch.zeros(T_total, 1, 24, 40))
+                    continue
+
+                seg_path = os.path.join(
+                    seg_root, self.mode, str(sample['episode_id']), f'{cam_id}.pt'
+                )
+                try:
+                    # 加载预计算的 seg mask：[T_seg, C, 192, 320]
+                    seg = torch.load(seg_path, map_location='cpu')
+                    T_seg = seg.shape[0]
+
+                    # 将 rgb_id（视频帧索引）映射到对应的 seg 帧索引
+                    # 公式：seg_idx = round(video_frame_idx * T_seg / video_length)
+                    # clamp 到合法范围 [0, T_seg-1]
+                    seg_ids = [
+                        min(round(f * T_seg / video_length), T_seg - 1)
+                        for f in rgb_id
+                    ]
+
+                    # 按映射后的帧索引取出对应帧：[T_total, C, 192, 320]
+                    seg_frames = seg[seg_ids]
+
+                    # 对所有 object 通道取 union（max）→ 单通道前景 mask
+                    # shape: [T_total, 1, 192, 320]，值域 {0.0, 1.0}
+                    mask = seg_frames.max(dim=1, keepdim=True).values.float()
+
+                    # Bilinear 下采样到 latent 分辨率 24×40
+                    # 与 VAE 的 8× 空间下采样等效，保证位置一一对应
+                    # shape: [T_total, 1, 24, 40]
+                    mask = torch.nn.functional.interpolate(
+                        mask, size=(24, 40), mode='bilinear', align_corners=False
+                    )
+
+                except Exception:
+                    # 文件不存在（DROID 无 seg）或读取出错 → 该相机用零 mask（均匀权重）
+                    mask = torch.zeros(T_total, 1, 24, 40)
+
+                cam_masks.append(mask)
+
+            # 沿 H 维度拼接 3 个相机 mask，与 latent 的空间布局对齐
+            # [T_total, 1, 24, 40] × 3  →  [T_total, 1, 72, 40]
+            seg_weight = torch.cat(cam_masks, dim=2)
+        else:
+            # seg_root_path 未配置 → 全零 mask（等价于原始均匀权重 MSE，无任何改变）
+            seg_weight = torch.zeros(T_total, 1, 72, 40)
+
+        # shape: [T_total, 1, 72, 40]，值域 [0, 1]
+        data['seg_weight'] = seg_weight
+
+        # =================================================================
+        # Optical flow for temporal warping consistency loss
+        #
+        # File: {flow_root_path}/{train|val}/{episode_id}/{cam_id}.pt
+        #   shape = [T_flow, 2, 256, 256], dtype=float32
+        #   channel 0 = dx (horizontal), channel 1 = dy (vertical), unit: pixels at 256x256
+        #   flow[t] = pixel displacement from original frame t to t+1
+        #
+        # Only compute warp loss between consecutive FUTURE frame pairs:
+        #   (future[0]->future[1]), (future[1]->future[2]), ... (num_frames-1 pairs)
+        # When skip>1, accumulate multiple flow fields (linear approximation).
+        #
+        # Temporal mapping (same as seg):
+        #   flow_idx = round(video_frame_idx * T_flow / video_length)
+        #
+        # Spatial: flow 256x256 -> latent 24x40
+        #   bilinear downsample + value rescaling: dx *= 40/256, dy *= 24/256
+        #   (video was squished from 192x320 to 256x256 for flow computation)
+        #
+        # Returns: data['flow'] shape = [num_frames-1, 2, 72, 40]
+        #   cam0->H[0:24], cam1->H[24:48], cam2->H[48:72] (zeros)
+        # =================================================================
+        T_future_pairs = self.args.num_frames - 1
+        flow_root = getattr(self.args, 'flow_root_path', None)
+
+        if flow_root is not None and T_future_pairs > 0:
+            video_length_f = label.get('video_length', max(rgb_id) + 1)
+            future_rgb_ids = rgb_id[self.args.num_history:]
+
+            cam_flows = []
+            for cam_id in [0, 1, 2]:
+                if cam_id == 2:
+                    cam_flows.append(torch.zeros(T_future_pairs, 2, 24, 40))
+                    continue
+
+                flow_path = os.path.join(
+                    flow_root, self.mode, str(sample['episode_id']), f'{cam_id}.pt'
+                )
+                try:
+                    flow_data = torch.load(flow_path, map_location='cpu')  # (T_flow, 2, 256, 256)
+                    T_flow = flow_data.shape[0]
+
+                    pair_flows = []
+                    for t in range(T_future_pairs):
+                        f_start = future_rgb_ids[t]
+                        f_end   = future_rgb_ids[t + 1]
+
+                        # Map video-frame indices to subsampled-frame indices
+                        # (seg/flow have stride ~2.5x relative to video frames)
+                        flow_idx_start = min(round(f_start * T_flow / video_length_f), T_flow - 1)
+                        flow_idx_end   = min(round(f_end   * T_flow / video_length_f), T_flow - 1)
+                        # Use subsampled-frame difference as accumulation steps,
+                        # not video-frame difference (which would overcount).
+                        # max(..., 1): when both map to the same subsampled frame,
+                        # still use that one flow field as the best approximation.
+                        n_sub_steps = max(flow_idx_end - flow_idx_start, 1)
+
+                        # Accumulate n_sub_steps consecutive flow fields
+                        accumulated = torch.zeros(2, 256, 256)
+                        for s in range(n_sub_steps):
+                            fi = min(flow_idx_start + s, T_flow - 1)
+                            accumulated += flow_data[fi]
+
+                        # Bilinear downsample 256x256 -> 24x40
+                        acc_small = torch.nn.functional.interpolate(
+                            accumulated.unsqueeze(0), size=(24, 40),
+                            mode='bilinear', align_corners=False
+                        ).squeeze(0)  # (2, 24, 40)
+
+                        # Rescale flow values from 256px units to latent-px units
+                        acc_small[0] *= (40.0 / 256.0)  # dx: width direction
+                        acc_small[1] *= (24.0 / 256.0)  # dy: height direction
+
+                        pair_flows.append(acc_small)
+
+                    cam_flows.append(torch.stack(pair_flows, dim=0))  # (T_future_pairs, 2, 24, 40)
+
+                except Exception:
+                    cam_flows.append(torch.zeros(T_future_pairs, 2, 24, 40))
+
+            # Concat along H: (T_future_pairs, 2, 24, 40) x3 -> (T_future_pairs, 2, 72, 40)
+            data['flow'] = torch.cat(cam_flows, dim=2)
+        else:
+            data['flow'] = torch.zeros(T_future_pairs, 2, 72, 40)
+
         # prepare action cond data
-        cartesian_pose = np.array(label['observation.state.cartesian_position'])[state_id]
-        gripper_pose = np.array(label['observation.state.gripper_position'])[state_id][..., np.newaxis]
-        action = np.concatenate((cartesian_pose, gripper_pose), axis=-1)
+        # Support both DROID format (observation.state.cartesian_position + gripper_position)
+        # and LIBERO format (states field directly)
+        if 'observation.state.cartesian_position' in label:
+            # DROID format: 6D cartesian + 1D gripper = 7D
+            cartesian_pose = np.array(label['observation.state.cartesian_position'])[state_id]
+            gripper_pose = np.array(label['observation.state.gripper_position'])[state_id][..., np.newaxis]
+            action = np.concatenate((cartesian_pose, gripper_pose), axis=-1)
+        elif 'states' in label:
+            # LIBERO format: 8D states (xyz + euler + gripper_left + gripper_right)
+            # Use the downsampled 'states' field which already matches video frame rate
+            action = np.array(label['states'])[state_id]
+        else:
+            raise ValueError("Annotation must contain either 'observation.state.cartesian_position' (DROID) or 'states' (LIBERO)")
+        
         action = self.normalize_bound(action, state_p01, state_p99)
         data['action'] = torch.tensor(action).float()
 
