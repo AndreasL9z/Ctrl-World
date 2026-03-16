@@ -10,16 +10,16 @@
 source /scr/yusenluo/anaconda3/etc/profile.d/conda.sh
 conda activate ctrl-world
 
-# CUDA_VISIBLE_DEVICES=0 python scripts/rollout_replay_traj.py \
-#   --dataset_root_path dataset_example \
-#   --dataset_meta_info_path dataset_meta_info \
-#   --dataset_names libero \
-#   --svd_model_path models/svd \
-#   --clip_model_path models/clip-vit-base-patch32 \
-#   --ckpt_path model_ckpt/libero_seq_3_seg_loss_flow_loss/checkpoint-35000.pt \
-#   --action_dim 8 \
-#   --task_type replay_libero
-#   > /scr2/yusenluo/Ctrl-World/rollout_replay_libero_seq_3_seg_loss_flow_loss_new.txt
+CUDA_VISIBLE_DEVICES=0 python scripts/rollout_replay_traj.py \
+  --dataset_root_path dataset_example \
+  --dataset_meta_info_path dataset_meta_info \
+  --dataset_names libero \
+  --svd_model_path models/svd \
+  --clip_model_path models/clip-vit-base-patch32 \
+  --ckpt_path model_ckpt/libero_seq_3/checkpoint-epoch2.pt \
+  --action_dim 8 \
+  --task_type replay_libero
+#   > /scr2/yusenluo/Ctrl-World/rollout_replay_libero_seq_3_epoch2.txt
 
 
 # XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 python scripts/rollout_interact_pi.py \
@@ -53,12 +53,12 @@ accelerate launch --main_process_port 29501 --mixed_precision fp16 scripts/train
     --validation_steps 2000
 
 
-# # CUDA_VISIBLE_DEVICES=0 accelerate launch dataset_example/extract_latent_libero_new.py \
-# #     --libero_data_path /scr2/yusenluo/libero \
-# #     --output_path dataset_example/libero \
-# #     --svd_path models/svd \
-# #     --rgb_skip 2 \
-# #     --size 192 320
+CUDA_VISIBLE_DEVICES=0 accelerate launch dataset_example/extract_latent_libero_new.py \
+    --libero_data_path /workspace/datasets/libero \
+    --output_path dataset_example/libero \
+    --svd_path models/svd \
+    --rgb_skip 2 \
+    --size 192 320
 
 # Train World Model on LIBERO dataset
 # accelerate launch --main_process_port 29501 scripts/train_wm.py \
@@ -69,3 +69,6 @@ accelerate launch --main_process_port 29501 --mixed_precision fp16 scripts/train
 #     --clip_model_path models/clip-vit-base-patch32 \
 #     --action_dim 8 \
 #     --down_sample 1 
+
+
+cp /workspace/.ssh/config ~/.ssh/config

@@ -11,3 +11,6 @@ decord
 einops
 scipy
 pandas
+scikit-image
+lpips
+torchmetrics

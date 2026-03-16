@@ -22,7 +22,7 @@ class wm_args:
     dataset_cfgs = dataset_names
     prob=[1.0]
     annotation_name='annotation' #'annotation_all_skip1'
-    num_workers=4
+    num_workers=8
     down_sample=1 # DROID: downsample 15hz to 5hz (state/video ratio).
     skip_step = 1
 
@@ -54,7 +54,7 @@ class wm_args:
 
     # logs parameters
     debug = False
-    tag = 'libero_seq_3_seg_loss_flow_loss'  # Changed from 'doird_subset' for LIBERO training
+    tag = 'libero_seq_3'  # Changed from 'doird_subset' for LIBERO training
     output_dir = f"model_ckpt/{tag}"
     wandb_run_name = tag
     wandb_project_name = "ctrl_world_libero"  # Changed from "droid_example"
@@ -64,7 +64,7 @@ class wm_args:
     learning_rate= 1e-5 # 5e-6
     gradient_accumulation_steps = 1
     mixed_precision = 'fp16'
-    train_batch_size = 3
+    train_batch_size = 8
     shuffle = True
     num_train_epochs = 5          # 主终止条件：跑几个 epoch
     max_train_steps = 999_999_999 # 安全上限（极大值=实际不生效，以 epoch 为准）
@@ -133,10 +133,10 @@ class wm_args:
 
         elif self.task_type == "replay_libero":
             self.val_dataset_dir = "dataset_example/libero"
-            self.val_id = ["99","199","299","399","499","599","699","799","899","999"]
+            self.val_id = ["99","199","299","399","499","599","699","799","899","999","1099","1199","1299","1399","1499","1599"]
             self.start_idx = [0] * len(self.val_id)
             self.instruction = [""] * len(self.val_id)
-            self.task_name = "Rollouts_replay_libero_seq_3_seg_loss_flow_loss_new"
+            self.task_name = "Rollouts_replay_libero_seq_3"
             self.data_stat_path = "dataset_meta_info/libero/stat.json"
             self.action_dim = 8
 

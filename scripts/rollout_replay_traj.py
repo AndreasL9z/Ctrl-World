@@ -482,6 +482,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_names', type=str, default=None)
     parser.add_argument('--task_type', type=str, default='replay')
     parser.add_argument('--action_dim', type=int, default=None, help='Action dimension (7 or 8)')
+    parser.add_argument('--use_wandb', action='store_true', help='Upload metrics and videos to wandb')
     args_new = parser.parse_args()
 
     args = wm_args(task_type=args_new.task_type)
@@ -498,6 +499,30 @@ if __name__ == "__main__":
     Agent = agent(args)
     eval_start_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     metrics_tracker = VideoMetrics(Agent.device)
+
+    # init wandb (aligned with train_wm.py: use args.wandb_project_name / args.tag)
+    use_wandb = args_new.use_wandb
+    if use_wandb:
+        run_name = f"eval_{eval_start_time}_{args.tag}"
+        wandb.init(
+            project=args.wandb_project_name,
+            name=run_name,
+            config={
+                "task_type":      args.task_type,
+                "task_name":      args.task_name,
+                "tag":            args.tag,
+                "ckpt_path":      str(args.ckpt_path),
+                "val_id":         args.val_id,
+                "pred_step":      args.pred_step,
+                "interact_num":   args.interact_num,
+                "num_frames":     args.num_frames,
+                "num_history":    args.num_history,
+                "action_dim":     args.action_dim,
+                "num_inference_steps": args.num_inference_steps,
+                "guidance_scale": args.guidance_scale,
+            },
+        )
+        print(f"[wandb] project={args.wandb_project_name}  run={run_name}")
     interact_num = args.interact_num
     pred_step = args.pred_step
     num_history = args.num_history
@@ -585,6 +610,18 @@ if __name__ == "__main__":
         os.makedirs(os.path.dirname(filename_video), exist_ok=True)
         mediapy.write_video(filename_video, video, fps=4)
         print(f"Saving video to {filename_video}")
+
+        # upload rollout video to wandb (key style aligned with train_wm.py: eval/video_*)
+        if use_wandb:
+            try:
+                wandb.log({
+                    f"eval/video_{val_id_i}_start{start_idx_i}": wandb.Video(
+                        filename_video, fps=4, format="mp4", caption=text_i
+                    )
+                })
+            except Exception as e:
+                print(f"Warning: Failed to upload video to wandb: {e}")
+
         print("##########################################################################")
 
     # ---- final aggregated metrics across all trajectories / steps ----
@@ -594,6 +631,11 @@ if __name__ == "__main__":
     with open(metrics_save_path, 'w') as f:
         json.dump(final_metrics, f, indent=2)
     print(f"Metrics saved to {metrics_save_path}")
+
+    # upload final metrics to wandb and finish
+    if use_wandb:
+        wandb.log({f"eval/{k}": v for k, v in final_metrics.items()})
+        wandb.finish()
 
 
 # CUDA_VISIBLE_DEVICES=0 python rollout_replay_traj.py
